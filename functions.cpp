@@ -7,16 +7,20 @@
 #include "to_string.hpp"
 #include "inspect.hpp"
 #include "eval.hpp"
+#include "util.hpp"
 #include "utf8_string.hpp"
 
+#include <cstdlib>
 #include <cmath>
 #include <cctype>
 #include <sstream>
+#include <string>
 #include <iomanip>
 #include <iostream>
 
 #define ARG(argname, argtype) get_arg<argtype>(argname, env, sig, path, position, backtrace)
 #define ARGR(argname, argtype, lo, hi) get_arg_r(argname, env, sig, path, position, lo, hi, backtrace)
+#define ARGM(argname, argtype, ctx) get_arg_m(argname, env, sig, path, position, backtrace, ctx)
 
 namespace Sass {
   using std::stringstream;
@@ -26,7 +30,7 @@ namespace Sass {
   {
     Parser sig_parser = Parser::from_c_str(sig, ctx, "[built-in function]");
     sig_parser.lex<Prelexer::identifier>();
-    string name(sig_parser.lexed);
+    string name(Util::normalize_underscores(sig_parser.lexed));
     Parameters* params = sig_parser.parse_parameters();
     return new (ctx.mem) Definition("[built-in function]",
                                     Position(),
@@ -41,7 +45,7 @@ namespace Sass {
   {
     Parser sig_parser = Parser::from_c_str(sig, ctx, "[c function]");
     sig_parser.lex<Prelexer::identifier>();
-    string name(sig_parser.lexed);
+    string name(Util::normalize_underscores(sig_parser.lexed));
     Parameters* params = sig_parser.parse_parameters();
     return new (ctx.mem) Definition("[c function]",
                                     Position(),
@@ -69,6 +73,20 @@ namespace Sass {
         msg += T::type_name();
         error(msg, path, position, backtrace);
       }
+      return val;
+    }
+
+    Map* get_arg_m(const string& argname, Env& env, Signature sig, const string& path, Position position, Backtrace* backtrace, Context& ctx)
+    {
+      // Minimal error handling -- the expectation is that built-ins will be written correctly!
+      Map* val = dynamic_cast<Map*>(env[argname]);
+      if (val) return val;
+
+      List* lval = dynamic_cast<List*>(env[argname]);
+      if (lval && lval->length() == 0) return new (ctx.mem) Map(path, position, 1);
+
+      // fallback on get_arg for error handling
+      val = get_arg<Map>(argname, env, sig, path, position, backtrace);
       return val;
     }
 
@@ -726,7 +744,7 @@ namespace Sass {
       if (index > 0 && index <= len) {
         // positive and within string length
         str.insert(UTF_8::code_point_offset_to_byte_offset(str, index-1), ins);
-      } 
+      }
       else if (index > len) {
         // positive and past string length
         str += ins;
@@ -917,6 +935,14 @@ namespace Sass {
     Signature length_sig = "length($list)";
     BUILT_IN(length)
     {
+      Expression* v = ARG("$list", Expression);
+      if (v->concrete_type() == Expression::MAP) {
+        Map* map = dynamic_cast<Map*>(env["$list"]);
+        return new (ctx.mem) Number(path,
+                                    position,
+                                    map ? map->length() : 1);
+      }
+
       List* list = dynamic_cast<List*>(env["$list"]);
       return new (ctx.mem) Number(path,
                                   position,
@@ -935,7 +961,7 @@ namespace Sass {
         *l << ARG("$list", Expression);
       }
       if (l->empty()) error("argument `$list` of `" + string(sig) + "` must not be empty", path, position);
-      size_t index = std::floor(n->value() < 0 ? l->length() + n->value() : n->value() - 1);
+      double index = std::floor(n->value() < 0 ? l->length() + n->value() : n->value() - 1);
       if (index < 0 || index > l->length() - 1) error("index out of bounds for `" + string(sig) + "`", path, position);
       return l->value_at_index(index);
     }
@@ -1056,6 +1082,99 @@ namespace Sass {
       return result;
     }
 
+    /////////////////
+    // MAP FUNCTIONS
+    /////////////////
+
+    Signature map_get_sig = "map-get($map, $key)";
+    BUILT_IN(map_get)
+    {
+      Map* m = ARGM("$map", Map, ctx);
+      Expression* v = ARG("$key", Expression);
+      if (!m || m->empty()) return new (ctx.mem) Null(path, position);
+      for (size_t i = 0, L = m->length(); i < L; ++i) {
+        if (eq((*m)[i]->key(), v, ctx)) return m->value_at_index(i);
+      }
+      return new (ctx.mem) Null(path, position);
+    }
+
+    Signature map_has_key_sig = "map-has-key($map, $key)";
+    BUILT_IN(map_has_key)
+    {
+      Map* m = ARGM("$map", Map, ctx);
+      Expression* v = ARG("$key", Expression);
+      if (!m || m->empty()) return new (ctx.mem) Boolean(path, position, false);
+      for (size_t i = 0, L = m->length(); i < L; ++i) {
+        if (eq((*m)[i]->key(), v, ctx)) return new (ctx.mem) Boolean(path, position, true);
+      }
+      return new (ctx.mem) Boolean(path, position, false);
+    }
+
+    Signature map_keys_sig = "map-keys($map)";
+    BUILT_IN(map_keys)
+    {
+      Map* m = ARGM("$map", Map, ctx);
+      List* result = new (ctx.mem) List(path, position, 1, List::COMMA);
+      if (!m || m->empty()) return result;
+      for (size_t i = 0, L = m->length(); i < L; ++i) {
+        *result << (*m)[i]->key();
+      }
+      return result;
+    }
+
+    Signature map_values_sig = "map-values($map)";
+    BUILT_IN(map_values)
+    {
+      Map* m = ARGM("$map", Map, ctx);
+      List* result = new (ctx.mem) List(path, position, 1, List::COMMA);
+      if (!m || m->empty()) return result;
+      for (size_t i = 0, L = m->length(); i < L; ++i) {
+        *result << (*m)[i]->value();
+      }
+      return result;
+    }
+
+    Signature map_merge_sig = "map-merge($map1, $map2)";
+    BUILT_IN(map_merge)
+    {
+      Map* m1 = ARGM("$map1", Map, ctx);
+      Map* m2 = ARGM("$map2", Map, ctx);
+
+      size_t len = m1->length() + m2->length();
+      Map* result = new (ctx.mem) Map(path, position, len);
+      *result += m1;
+      *result += m2;
+      return result;
+    }
+
+    Signature map_remove_sig = "map-remove($map, $key)";
+    BUILT_IN(map_remove)
+    {
+      Map* m = ARGM("$map", Map, ctx);
+      Expression* v = ARG("$key", Expression);
+      Map* result = new (ctx.mem) Map(path, position, 1);
+      for (size_t i = 0, L = m->length(); i < L; ++i) {
+        if (!eq((*m)[i]->key(), v, ctx)) *result << (*m)[i];
+      }
+      return result;
+    }
+
+    Signature keywords_sig = "keywords($args)";
+    BUILT_IN(keywords)
+    {
+      List* arglist = new (ctx.mem) List(*ARG("$args", List));
+      Map* result = new (ctx.mem) Map(path, position, 1);
+      for (size_t i = 0, L = arglist->length(); i < L; ++i) {
+        string name = string(((Argument*)(*arglist)[i])->name());
+        string sanitized_name = string(name, 1);
+        *result << new (ctx.mem) KeyValuePair(path,
+                                              position,
+                                              new (ctx.mem) String_Constant(path, position, sanitized_name),
+                                              ((Argument*)(*arglist)[i])->value());
+      }
+      return result;
+    }
+
     //////////////////////////
     // INTROSPECTION FUNCTIONS
     //////////////////////////
@@ -1095,6 +1214,58 @@ namespace Sass {
       return new (ctx.mem) Boolean(path, position, n1->unit() == tmp_n2.unit());
     }
 
+    Signature variable_exists_sig = "variable-exists($name)";
+    BUILT_IN(variable_exists)
+    {
+      string s = unquote(ARG("$name", String_Constant)->value());
+
+      if(d_env.has("$"+s)) {
+        return new (ctx.mem) Boolean(path, position, true);
+      }
+      else {
+        return new (ctx.mem) Boolean(path, position, false);
+      }
+    }
+
+    Signature global_variable_exists_sig = "global-variable-exists($name)";
+    BUILT_IN(global_variable_exists)
+    {
+      string s = unquote(ARG("$name", String_Constant)->value());
+
+      if(d_env.global_frame_has("$"+s)) {
+        return new (ctx.mem) Boolean(path, position, true);
+      }
+      else {
+        return new (ctx.mem) Boolean(path, position, false);
+      }
+    }
+
+    Signature function_exists_sig = "function-exists($name)";
+    BUILT_IN(function_exists)
+    {
+      string s = unquote(ARG("$name", String_Constant)->value());
+
+      if(d_env.global_frame_has(s+"[f]")) {
+        return new (ctx.mem) Boolean(path, position, true);
+      }
+      else {
+        return new (ctx.mem) Boolean(path, position, false);
+      }
+    }
+
+    Signature mixin_exists_sig = "mixin-exists($name)";
+    BUILT_IN(mixin_exists)
+    {
+      string s = unquote(ARG("$name", String_Constant)->value());
+
+      if(d_env.global_frame_has(s+"[m]")) {
+        return new (ctx.mem) Boolean(path, position, true);
+      }
+      else {
+        return new (ctx.mem) Boolean(path, position, false);
+      }
+    }
+
     ////////////////////
     // BOOLEAN FUNCTIONS
     ////////////////////
@@ -1104,8 +1275,19 @@ namespace Sass {
     { return new (ctx.mem) Boolean(path, position, ARG("$value", Expression)->is_false()); }
 
     Signature if_sig = "if($condition, $if-true, $if-false)";
+    // BUILT_IN(sass_if)
+    // { return ARG("$condition", Expression)->is_false() ? ARG("$if-false", Expression) : ARG("$if-true", Expression); }
     BUILT_IN(sass_if)
-    { return ARG("$condition", Expression)->is_false() ? ARG("$if-false", Expression) : ARG("$if-true", Expression); }
+    {
+      Eval eval(ctx, &d_env, backtrace);
+      bool is_true = !ARG("$condition", Expression)->perform(&eval)->is_false();
+      if (is_true) {
+        return ARG("$if-true", Expression)->perform(&eval);
+      }
+      else {
+        return ARG("$if-false", Expression)->perform(&eval);
+      }
+    }
 
     ////////////////
     // URL FUNCTIONS
